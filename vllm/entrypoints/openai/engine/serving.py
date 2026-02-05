@@ -125,6 +125,7 @@ from vllm.utils.async_utils import (
     collect_from_async_generator,
     merge_async_iterators,
 )
+from vllm.v1.engine import EngineCoreRequest
 
 
 def _timeout_watcher(
@@ -151,7 +152,6 @@ def _timeout_watcher(
         await abort_fn(request_id)
 
     return asyncio.create_task(abort_after_timeout())
-from vllm.v1.engine import EngineCoreRequest
 
 
 class GenerationError(Exception):

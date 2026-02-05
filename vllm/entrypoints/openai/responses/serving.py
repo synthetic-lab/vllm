@@ -7,11 +7,11 @@ import time
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from copy import copy
 from dataclasses import dataclass, replace
 from http import HTTPStatus
-from typing import Final
+from typing import Any, Final
 
 import jinja2
 from fastapi import Request
@@ -299,10 +299,8 @@ class OpenAIServingResponses(OpenAIServing):
                     yield item
             finally:
                 timeout_task.cancel()
-                try:
+                with suppress(asyncio.CancelledError):
                     await timeout_task
-                except asyncio.CancelledError:
-                    pass
 
         return wrapped()
 
@@ -622,10 +620,8 @@ class OpenAIServingResponses(OpenAIServing):
         finally:
             if timeout_task is not None:
                 timeout_task.cancel()
-                try:
+                with suppress(asyncio.CancelledError):
                     await timeout_task
-                except asyncio.CancelledError:
-                    pass
 
     async def _make_request(
         self,
