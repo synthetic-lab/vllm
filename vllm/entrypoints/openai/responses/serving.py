@@ -203,6 +203,7 @@ class OpenAIServingResponses(OpenAIServing):
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
         log_error_stack: bool = False,
+        max_request_secs: float | None = None,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -215,6 +216,7 @@ class OpenAIServingResponses(OpenAIServing):
         self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
         self.enable_log_outputs = enable_log_outputs
+        self.max_request_secs = max_request_secs
 
         self.reasoning_parser = self._get_reasoning_parser(
             reasoning_parser_name=reasoning_parser
@@ -276,6 +278,33 @@ class OpenAIServingResponses(OpenAIServing):
         self.background_tasks: dict[str, asyncio.Task] = {}
 
         self.tool_server = tool_server
+
+    async def _abort_after_timeout(self, request_id: str, timeout_secs: float) -> None:
+        """Abort the request after the specified timeout."""
+        await asyncio.sleep(timeout_secs)
+        await self.engine_client.abort(request_id)
+
+    def _wrap_generator_with_timeout(
+        self,
+        generator: AsyncGenerator[Any, None],
+        timeout_task: asyncio.Task | None,
+    ) -> AsyncGenerator[Any, None]:
+        """Wrap a generator to cancel timeout task on completion."""
+        if timeout_task is None:
+            return generator
+
+        async def wrapped():
+            try:
+                async for item in generator:
+                    yield item
+            finally:
+                timeout_task.cancel()
+                try:
+                    await timeout_task
+                except asyncio.CancelledError:
+                    pass
+
+        return wrapped()
 
     def _validate_generator_input(
         self, engine_prompt: TokensPrompt
@@ -491,6 +520,13 @@ class OpenAIServingResponses(OpenAIServing):
         assert len(generators) == 1
         (result_generator,) = generators
 
+        # Set up timeout watcher if max_request_secs is configured
+        timeout_task = None
+        if self.max_request_secs is not None and self.max_request_secs > 0:
+            timeout_task = asyncio.create_task(
+                self._abort_after_timeout(request.request_id, self.max_request_secs)
+            )
+
         # Store the input messages.
         if request.store:
             self.msg_store[request.request_id] = messages
@@ -546,12 +582,18 @@ class OpenAIServingResponses(OpenAIServing):
                 lambda _: self.background_tasks.pop(response_id, None)
             )
 
+            # Cancel timeout task when background task completes
+            if timeout_task is not None:
+                task.add_done_callback(
+                    lambda _: timeout_task.cancel() if not timeout_task.done() else None
+                )
+
             if request.stream:
                 return self.responses_background_stream_generator(request.request_id)
             return response
 
         if request.stream:
-            return self.responses_stream_generator(
+            generator = self.responses_stream_generator(
                 request,
                 sampling_params,
                 result_generator,
@@ -560,9 +602,10 @@ class OpenAIServingResponses(OpenAIServing):
                 tokenizer,
                 request_metadata,
             )
+            return self._wrap_generator_with_timeout(generator, timeout_task)
 
         try:
-            return await self.responses_full_generator(
+            response = await self.responses_full_generator(
                 request,
                 sampling_params,
                 result_generator,
@@ -571,10 +614,18 @@ class OpenAIServingResponses(OpenAIServing):
                 tokenizer,
                 request_metadata,
             )
+            return response
         except GenerationError as e:
             return self._convert_generation_error_to_response(e)
         except Exception as e:
             return self.create_error_response(e)
+        finally:
+            if timeout_task is not None:
+                timeout_task.cancel()
+                try:
+                    await timeout_task
+                except asyncio.CancelledError:
+                    pass
 
     async def _make_request(
         self,

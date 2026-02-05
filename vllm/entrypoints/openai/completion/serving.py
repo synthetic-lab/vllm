@@ -59,6 +59,7 @@ class OpenAIServingCompletion(OpenAIServing):
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         log_error_stack: bool = False,
+        max_request_secs: float | None = None,
     ):
         super().__init__(
             engine_client=engine_client,
@@ -73,8 +74,36 @@ class OpenAIServingCompletion(OpenAIServing):
 
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
+        self.max_request_secs = max_request_secs
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+
+    async def _abort_after_timeout(self, request_id: str, timeout_secs: float) -> None:
+        """Abort the request after the specified timeout."""
+        await asyncio.sleep(timeout_secs)
+        await self.engine_client.abort(request_id)
+
+    def _wrap_generator_with_timeout(
+        self,
+        generator: AsyncGenerator[str, None],
+        timeout_task: asyncio.Task | None,
+    ) -> AsyncGenerator[str, None]:
+        """Wrap a generator to cancel timeout task on completion."""
+        if timeout_task is None:
+            return generator
+
+        async def wrapped():
+            try:
+                async for item in generator:
+                    yield item
+            finally:
+                timeout_task.cancel()
+                try:
+                    await timeout_task
+                except asyncio.CancelledError:
+                    pass
+
+        return wrapped()
 
     async def render_completion_request(
         self,
@@ -262,11 +291,18 @@ class OpenAIServingCompletion(OpenAIServing):
         # We do not stream the results when using beam search.
         stream = request.stream and not request.use_beam_search
 
+        # Set up timeout watcher if max_request_secs is configured
+        timeout_task = None
+        if self.max_request_secs is not None and self.max_request_secs > 0:
+            timeout_task = asyncio.create_task(
+                self._abort_after_timeout(request_id, self.max_request_secs)
+            )
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
 
         if stream:
-            return self.completion_stream_generator(
+            generator = self.completion_stream_generator(
                 request,
                 engine_prompts,
                 result_generator,
@@ -277,6 +313,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 tokenizer=tokenizer,
                 request_metadata=request_metadata,
             )
+            return self._wrap_generator_with_timeout(generator, timeout_task)
 
         # Non-streaming response
         final_res_batch: list[RequestOutput | None] = [None] * num_prompts
@@ -315,6 +352,13 @@ class OpenAIServingCompletion(OpenAIServing):
             return self._convert_generation_error_to_response(e)
         except ValueError as e:
             return self.create_error_response(e)
+        finally:
+            if timeout_task is not None:
+                timeout_task.cancel()
+                try:
+                    await timeout_task
+                except asyncio.CancelledError:
+                    pass
 
         # When user requests streaming but we don't stream, we still need to
         # return a streaming response with a single event.
