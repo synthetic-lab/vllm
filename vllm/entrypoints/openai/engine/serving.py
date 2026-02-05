@@ -5,7 +5,7 @@ import json
 import sys
 import time
 import traceback
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, ClassVar, Generic, TypeAlias, TypeVar, cast
@@ -126,32 +126,6 @@ from vllm.utils.async_utils import (
     merge_async_iterators,
 )
 from vllm.v1.engine import EngineCoreRequest
-
-
-def _timeout_watcher(
-    request_id: str,
-    timeout_secs: float | None,
-    abort_fn: Callable[[str], Awaitable[None]],
-) -> asyncio.Task | None:
-    """
-    Create a background task that aborts the request after timeout_secs.
-
-    Args:
-        request_id: The unique ID of the request to abort
-        timeout_secs: Maximum time to allow the request to run
-        abort_fn: Async function to call to abort the request
-
-    Returns:
-        An asyncio Task if timeout is set, None otherwise
-    """
-    if timeout_secs is None or timeout_secs <= 0:
-        return None
-
-    async def abort_after_timeout():
-        await asyncio.sleep(timeout_secs)
-        await abort_fn(request_id)
-
-    return asyncio.create_task(abort_after_timeout())
 
 
 class GenerationError(Exception):
