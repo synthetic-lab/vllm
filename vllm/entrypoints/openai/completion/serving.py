@@ -5,6 +5,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
+from contextlib import suppress
 from typing import cast
 
 import jinja2
@@ -77,33 +78,6 @@ class OpenAIServingCompletion(OpenAIServing):
         self.max_request_secs = max_request_secs
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
-
-    async def _abort_after_timeout(self, request_id: str, timeout_secs: float) -> None:
-        """Abort the request after the specified timeout."""
-        await asyncio.sleep(timeout_secs)
-        await self.engine_client.abort(request_id)
-
-    def _wrap_generator_with_timeout(
-        self,
-        generator: AsyncGenerator[str, None],
-        timeout_task: asyncio.Task | None,
-    ) -> AsyncGenerator[str, None]:
-        """Wrap a generator to cancel timeout task on completion."""
-        if timeout_task is None:
-            return generator
-
-        async def wrapped():
-            try:
-                async for item in generator:
-                    yield item
-            finally:
-                timeout_task.cancel()
-                try:
-                    await timeout_task
-                except asyncio.CancelledError:
-                    pass
-
-        return wrapped()
 
     async def render_completion_request(
         self,
@@ -355,10 +329,8 @@ class OpenAIServingCompletion(OpenAIServing):
         finally:
             if timeout_task is not None:
                 timeout_task.cancel()
-                try:
+                with suppress(asyncio.CancelledError):
                     await timeout_task
-                except asyncio.CancelledError:
-                    pass
 
         # When user requests streaming but we don't stream, we still need to
         # return a streaming response with a single event.
