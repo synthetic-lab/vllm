@@ -212,6 +212,9 @@ class FrontendArgs:
     Enable offline FastAPI documentation for air-gapped environments.
     Uses vendored static assets bundled with vLLM.
     """
+    max_request_secs: float | None = None
+    """Maximum time in seconds to process a request. If a request exceeds this
+    limit, it will be aborted. None means no timeout."""
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
@@ -250,6 +253,9 @@ class FrontendArgs:
         frontend_kwargs["tool_call_parser"]["metavar"] = (
             f"{{{parsers_str}}} or name registered in --tool-parser-plugin"
         )
+
+        # Special case: max_request_secs needs optional_type(float)
+        frontend_kwargs["max_request_secs"]["type"] = optional_type(float)
 
         frontend_group = parser.add_argument_group(
             title="Frontend",

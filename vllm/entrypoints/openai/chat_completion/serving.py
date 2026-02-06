@@ -6,6 +6,7 @@ import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
+from contextlib import suppress
 from typing import Any, Final
 
 import jinja2
@@ -109,6 +110,7 @@ class OpenAIServingChat(OpenAIServing):
         enable_log_deltas: bool = True,
         log_error_stack: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        max_request_secs: float | None = None,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -125,6 +127,7 @@ class OpenAIServingChat(OpenAIServing):
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.enable_log_outputs = enable_log_outputs
         self.enable_log_deltas = enable_log_deltas
+        self.max_request_secs = max_request_secs
 
         # set up logits processors
         self.logits_processors = self.model_config.logits_processors
@@ -452,11 +455,18 @@ class OpenAIServingChat(OpenAIServing):
         assert len(generators) == 1
         (result_generator,) = generators
 
+        # Set up timeout watcher if max_request_secs is configured
+        timeout_task = None
+        if self.max_request_secs is not None and self.max_request_secs > 0:
+            timeout_task = asyncio.create_task(
+                self._abort_after_timeout(request_id, self.max_request_secs)
+            )
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
 
         if request.stream:
-            return self.chat_completion_stream_generator(
+            return self.chat_completion_stream_generator_with_timeout(
                 request,
                 result_generator,
                 request_id,
@@ -464,10 +474,11 @@ class OpenAIServingChat(OpenAIServing):
                 conversation,
                 tokenizer,
                 request_metadata,
+                timeout_task,
             )
 
         try:
-            return await self.chat_completion_full_generator(
+            return await self.chat_completion_full_generator_with_timeout(
                 request,
                 result_generator,
                 request_id,
@@ -475,6 +486,7 @@ class OpenAIServingChat(OpenAIServing):
                 conversation,
                 tokenizer,
                 request_metadata,
+                timeout_task,
             )
         except GenerationError as e:
             return self._convert_generation_error_to_response(e)
@@ -624,6 +636,57 @@ class OpenAIServingChat(OpenAIServing):
                         delta_message = None
 
         return delta_message, function_name_returned
+
+    def chat_completion_stream_generator_with_timeout(
+        self,
+        request: ChatCompletionRequest,
+        result_generator: AsyncIterator[RequestOutput],
+        request_id: str,
+        model_name: str,
+        conversation: list[ConversationMessage],
+        tokenizer: TokenizerLike | None,
+        request_metadata: RequestResponseMetadata,
+        timeout_task: asyncio.Task | None,
+    ) -> AsyncGenerator[str, None]:
+        """Wrapper that adds timeout handling to stream generator."""
+        generator = self.chat_completion_stream_generator(
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            conversation,
+            tokenizer,
+            request_metadata,
+        )
+        return self._wrap_generator_with_timeout(generator, timeout_task)
+
+    async def chat_completion_full_generator_with_timeout(
+        self,
+        request: ChatCompletionRequest,
+        result_generator: AsyncIterator[RequestOutput],
+        request_id: str,
+        model_name: str,
+        conversation: list[ConversationMessage],
+        tokenizer: TokenizerLike | None,
+        request_metadata: RequestResponseMetadata,
+        timeout_task: asyncio.Task | None,
+    ) -> ChatCompletionResponse | ErrorResponse:
+        """Wrapper that adds timeout handling to full generator."""
+        try:
+            return await self.chat_completion_full_generator(
+                request,
+                result_generator,
+                request_id,
+                model_name,
+                conversation,
+                tokenizer,
+                request_metadata,
+            )
+        finally:
+            if timeout_task is not None:
+                timeout_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await timeout_task
 
     async def chat_completion_stream_generator(
         self,

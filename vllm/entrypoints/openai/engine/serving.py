@@ -6,6 +6,7 @@ import sys
 import time
 import traceback
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, ClassVar, Generic, TypeAlias, TypeVar, cast
@@ -712,6 +713,31 @@ class OpenAIServing:
 
         except Exception as e:
             return self.create_error_response(e)
+
+    async def _abort_after_timeout(self, request_id: str, timeout_secs: float) -> None:
+        """Abort the request after the specified timeout."""
+        await asyncio.sleep(timeout_secs)
+        await self.engine_client.abort(request_id)
+
+    def _wrap_generator_with_timeout(
+        self,
+        generator: AsyncGenerator[str, None],
+        timeout_task: asyncio.Task | None,
+    ) -> AsyncGenerator[str, None]:
+        """Wrap a generator to cancel timeout task on completion."""
+        if timeout_task is None:
+            return generator
+
+        async def wrapped():
+            try:
+                async for item in generator:
+                    yield item
+            finally:
+                timeout_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await timeout_task
+
+        return wrapped()
 
     async def _collect_batch(
         self,
