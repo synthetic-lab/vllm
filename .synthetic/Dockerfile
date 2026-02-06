@@ -1,6 +1,6 @@
 # Dockerfile to patch vLLM with custom reasoning parser changes
 # Based on vllm/vllm-openai:v0.15.0
-# Build with: docker build -f .synththetic/Dockerfile -t synthetic-vllm:<VERSION> .
+# Build with: docker build -f .synththetic/Dockerfile -t syntheticdreamlabs/synthetic-vllm:<VERSION> .
 
 FROM vllm/vllm-openai:v0.15.0
 
