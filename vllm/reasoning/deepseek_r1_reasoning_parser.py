@@ -47,25 +47,13 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
             and self.start_token_id not in previous_token_ids
             and self.start_token_id not in delta_token_ids
         ):
-            if self.end_token_id in delta_token_ids:
-                # end token in delta with more tokens,
-                # extract reasoning content and content
-                end_index = delta_text.find(self.end_token)
-                reasoning = delta_text[:end_index]
-                content = delta_text[end_index + len(self.end_token) :]
+            end_present, tool_present = self._end_token_present(delta_token_ids)
+            if end_present or tool_present:
+                # An end token is in delta, use helper to split
+                reasoning, content = self._split_reasoning_from_content(delta_text)
                 return DeltaMessage(
                     reasoning=reasoning,
-                    content=content if content else None,
-                )
-            elif self.tool_start_token_id is not None and self.tool_start_token is not None and self.tool_start_token_id in delta_token_ids:
-                # tool_start token in delta with more tokens,
-                # reasoning ends but tool_start is preserved in content
-                tool_start_index = delta_text.find(self.tool_start_token)
-                reasoning = delta_text[:tool_start_index]
-                content = delta_text[tool_start_index:]
-                return DeltaMessage(
-                    reasoning=reasoning,
-                    content=content if content else None,
+                    content=content,
                 )
             elif self.end_token_id in previous_token_ids:
                 # end token in previous, thinking content ends

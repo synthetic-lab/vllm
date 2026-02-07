@@ -90,6 +90,42 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 )
             self.tool_start_token_id = tool_token_id
 
+    def _split_reasoning_from_content(
+        self,
+        text: str,
+        start_offset: int = 0,
+    ) -> tuple[str, str | None]:
+        """
+        Split text into reasoning and content based on which end token comes first.
+
+        Args:
+            text: The text to split
+            start_offset: Offset to start searching from (for stripping start_token)
+
+        Returns:
+            Tuple of (reasoning, content). Content is None if no end token found.
+            If tool_start_token comes first, it's preserved in content.
+            If end_token comes first, it's stripped from content.
+        """
+        search_text = text[start_offset:]
+
+        end_index = search_text.find(self.end_token)
+        tool_index = search_text.find(self.tool_start_token) if self.tool_start_token else -1
+
+        if end_index != -1 and (tool_index == -1 or end_index < tool_index):
+            # end_token comes first
+            reasoning = search_text[:end_index]
+            content = search_text[end_index + len(self.end_token):]
+            return reasoning, content if content else None
+        elif tool_index != -1:
+            # tool_start_token comes first - preserve it in content
+            reasoning = search_text[:tool_index]
+            content = search_text[tool_index:]
+            return reasoning, content if content else None
+        else:
+            # No end token found
+            return search_text, None
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         start_token_id = self.start_token_id
         end_token_id = self.end_token_id
@@ -138,6 +174,17 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         return []
 
+    def _end_token_present(
+        self, delta_token_ids: Sequence[int]
+    ) -> tuple[bool, bool]:
+        """Check if end_token or tool_start_token is present in delta."""
+        end_present = self.end_token_id in delta_token_ids
+        tool_present = (
+            self.tool_start_token_id is not None
+            and self.tool_start_token_id in delta_token_ids
+        )
+        return end_present, tool_present
+
     def extract_reasoning_streaming(
         self,
         previous_text: str,
@@ -165,24 +212,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
         # Check if start token is present in previous or delta.
         # Keep compatibility with models that don't generate start tokens.
         if self.start_token_id in previous_token_ids:
-            if end_token_id in delta_token_ids:
-                # start token in previous, end token in delta,
-                # extract reasoning content
-                end_index = delta_text.find(self.end_token)
-                reasoning = delta_text[:end_index]
-                content = delta_text[end_index + len(self.end_token) :]
+            end_present, tool_present = self._end_token_present(delta_token_ids)
+            if end_present or tool_present:
+                # An end token is in delta, use helper to split
+                reasoning, content = self._split_reasoning_from_content(delta_text)
                 return DeltaMessage(
-                    reasoning=reasoning, content=content if content else None
-                )
-            elif tool_start_token_id is not None and self.tool_start_token is not None and tool_start_token_id in delta_token_ids:
-                # start token in previous, tool_start token in delta,
-                # reasoning ends but tool_start is preserved in content
-                tool_start_index = delta_text.find(self.tool_start_token)
-                reasoning = delta_text[:tool_start_index]
-                # Content INCLUDES the tool_start_token (not stripped)
-                content = delta_text[tool_start_index:]
-                return DeltaMessage(
-                    reasoning=reasoning, content=content if content else None
+                    reasoning=reasoning, content=content
                 )
             elif end_token_id in previous_token_ids:
                 # start token in previous, end token in previous,
@@ -197,26 +232,16 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 # reasoning content continues
                 return DeltaMessage(reasoning=delta_text)
         elif self.start_token_id in delta_token_ids:
-            if end_token_id in delta_token_ids:
-                # start token in delta, end token in delta,
-                # extract reasoning content
+            end_present, tool_present = self._end_token_present(delta_token_ids)
+            if end_present or tool_present:
+                # Both start and an end token in delta, find start then split
                 start_index = delta_text.find(self.start_token)
-                end_index = delta_text.find(self.end_token)
-                reasoning = delta_text[start_index + len(self.start_token) : end_index]
-                content = delta_text[end_index + len(self.end_token) :]
-                return DeltaMessage(
-                    reasoning=reasoning, content=content if content else None
+                after_start = start_index + len(self.start_token)
+                reasoning, content = self._split_reasoning_from_content(
+                    delta_text, start_offset=after_start
                 )
-            elif tool_start_token_id is not None and self.tool_start_token is not None and tool_start_token_id in delta_token_ids:
-                # start token in delta, tool_start token in delta,
-                # extract reasoning content, preserve tool_start in content
-                start_index = delta_text.find(self.start_token)
-                tool_start_index = delta_text.find(self.tool_start_token)
-                reasoning = delta_text[start_index + len(self.start_token) : tool_start_index]
-                # Content includes tool_start_token
-                content = delta_text[tool_start_index:]
                 return DeltaMessage(
-                    reasoning=reasoning, content=content if content else None
+                    reasoning=reasoning, content=content
                 )
             else:
                 # start token in delta, no end token in delta,
@@ -238,8 +263,6 @@ class BaseThinkingReasoningParser(ReasoningParser):
         Note: tool_start_token ends reasoning but is preserved in content
         for downstream parsers to handle.
         """
-        tool_start_token = self.tool_start_token
-
         # Check if the start token is present in the model output, remove it
         # if it is present.
         model_output_parts = model_output.partition(self.start_token)
@@ -247,21 +270,6 @@ class BaseThinkingReasoningParser(ReasoningParser):
             model_output_parts[2] if model_output_parts[1] else model_output_parts[0]
         )
 
-        # Check for end_token first
-        if self.end_token in model_output:
-            reasoning, _, content = model_output.partition(self.end_token)
-            # If generation stops right after end-of-think, return null content
-            final_content = content or None
-            return reasoning, final_content
-
-        # Check for tool_start_token - reasoning ends but token is preserved
-        if tool_start_token is not None and tool_start_token in model_output:
-            tool_index = model_output.find(tool_start_token)
-            reasoning = model_output[:tool_index]
-            # Content includes tool_start_token
-            content = model_output[tool_index:]
-            final_content = content or None
-            return reasoning, final_content
-
-        # No end token found, all is reasoning
-        return model_output, None
+        # Use helper to split reasoning from content
+        reasoning, content = self._split_reasoning_from_content(model_output)
+        return reasoning, content
