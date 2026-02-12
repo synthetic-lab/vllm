@@ -11,7 +11,10 @@ COPY vllm/reasoning/basic_parsers.py /usr/local/lib/python3.12/dist-packages/vll
 COPY vllm/reasoning/kimi_k2_reasoning_parser.py /usr/local/lib/python3.12/dist-packages/vllm/reasoning/kimi_k2_reasoning_parser.py
 COPY vllm/reasoning/deepseek_r1_reasoning_parser.py /usr/local/lib/python3.12/dist-packages/vllm/reasoning/deepseek_r1_reasoning_parser.py
 
-# Copy patched files from https://github.com/synthetic-lab/vllm/pull/1 (Add --max-request-secs to vllm serve)
+# Tool call parsing fixes
+COPY vllm/tool_parsers/kimi_k2_tool_parser.py /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/kimi_k2_tool_parser.py
+
+# Max request second feature
 COPY vllm/entrypoints/openai/chat_completion/serving.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/chat_completion/serving.py
 COPY vllm/entrypoints/openai/completion/serving.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/completion/serving.py
 COPY vllm/entrypoints/openai/engine/serving.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/engine/serving.py

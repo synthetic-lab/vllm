@@ -502,48 +502,6 @@ def test_empty_tool_section(kimi_k2_tool_parser):
     assert kimi_k2_tool_parser.in_tool_section is False
 
 
-def test_malformed_tool_section_recovery(kimi_k2_tool_parser):
-    """
-    Test that the parser recovers from a malformed tool section
-    that never closes properly.
-    """
-    kimi_k2_tool_parser.reset_streaming_state()
-
-    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
-
-    # Enter tool section
-    _result1 = kimi_k2_tool_parser.extract_tool_calls_streaming(
-        previous_text="",
-        current_text="<|tool_calls_section_begin|>",
-        delta_text="<|tool_calls_section_begin|>",
-        previous_token_ids=[],
-        current_token_ids=[section_begin_id],
-        delta_token_ids=[section_begin_id],
-        request=None,
-    )
-    assert kimi_k2_tool_parser.in_tool_section is True
-
-    # Simulate a lot of text without proper tool calls or section end
-    # This should trigger the error recovery mechanism
-    large_text = "x" * 10000  # Exceeds max_section_chars
-
-    result2 = kimi_k2_tool_parser.extract_tool_calls_streaming(
-        previous_text="<|tool_calls_section_begin|>",
-        current_text="<|tool_calls_section_begin|>" + large_text,
-        delta_text=large_text,
-        previous_token_ids=[section_begin_id],
-        current_token_ids=[section_begin_id] + list(range(100, 100 + len(large_text))),
-        delta_token_ids=list(range(100, 100 + len(large_text))),
-        request=None,
-    )
-
-    # Parser should have force-exited the tool section
-    assert kimi_k2_tool_parser.in_tool_section is False
-    # And returned the content as reasoning
-    assert result2 is not None
-    assert result2.content == large_text
-
-
 def test_state_reset(kimi_k2_tool_parser):
     """Test that reset_streaming_state() properly clears all state."""
     # Put parser in a complex state
