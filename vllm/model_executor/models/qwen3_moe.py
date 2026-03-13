@@ -32,7 +32,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -43,6 +42,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -428,7 +428,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Qwen3MoeModel(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        decoder_layer_type: type[torch.nn.Module] = Qwen3MoeDecoderLayer,
+    ):
         super().__init__()
 
         config = vllm_config.model_config.hf_text_config
@@ -437,7 +443,6 @@ class Qwen3MoeModel(nn.Module):
         eplb_config = parallel_config.eplb_config
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.config = config
         self.quant_config = quant_config
@@ -449,7 +454,7 @@ class Qwen3MoeModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix),
+            lambda prefix: decoder_layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -464,7 +469,7 @@ class Qwen3MoeModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -530,10 +535,6 @@ class Qwen3MoeModel(nn.Module):
         ignore_suffixes = (
             ".bias",
             "_bias",
-            ".k_scale",
-            "_k_scale",
-            ".v_scale",
-            "_v_scale",
             ".weight_scale",
             "_weight_scale",
             ".input_scale",
@@ -557,6 +558,10 @@ class Qwen3MoeModel(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(scale_name)
                 continue
+            if "scale" in name or "zero_point" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -649,20 +654,8 @@ class Qwen3MoeModel(nn.Module):
                     # Skip layers on other devices.
                     if is_pp_missing_parameter(name, self):
                         continue
-                    # Remapping the name of FP8 kv-scale.
-                    if name.endswith("kv_scale"):
-                        remapped_kv_scale_name = name.replace(
-                            ".kv_scale", ".attn.kv_scale"
-                        )
-                        if remapped_kv_scale_name not in params_dict:
-                            logger.warning_once(
-                                "Found kv scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv-scale is not loaded.",  # noqa: E501
-                                name,
-                                remapped_kv_scale_name,
-                            )
-                            continue
-                        else:
-                            name = remapped_kv_scale_name
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -681,6 +674,11 @@ class Qwen3MoeForCausalLM(
             "k_proj",
             "v_proj",
         ]
+    }
+
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
     }
 
     fall_back_to_pt_during_load = False
@@ -765,7 +763,7 @@ class Qwen3MoeForCausalLM(
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

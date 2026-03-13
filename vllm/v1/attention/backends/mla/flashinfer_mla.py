@@ -69,7 +69,7 @@ class FlashInferMLABackend(MLACommonBackend):
         head_size: int,
         dtype: torch.dtype,
         kv_cache_dtype: CacheDType | None,
-        block_size: int,
+        block_size: int | None,
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
@@ -150,7 +150,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
 
-    def _forward_decode(
+    def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
