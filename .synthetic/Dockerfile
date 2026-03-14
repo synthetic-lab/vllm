@@ -1,25 +1,14 @@
-# Dockerfile to patch vLLM with custom reasoning parser changes
+# Dockerfile to patch vLLM with custom changes
 # Based on vllm/vllm-openai:v0.15.0
-# Build with: docker build -f .synththetic/Dockerfile -t syntheticdreamlabs/synthetic-vllm:<VERSION> .
+# Build with: docker build -f .synthetic/Dockerfile -t syntheticdreamlabs/synthetic-vllm:<VERSION> .
 
-FROM vllm/vllm-openai:v0.15.0
+FROM vllm/vllm-openai:nightly-bc2c0c86efb28e77677a3cfb8687e976914a313a
 
-# Copy the patched and new reasoning parser files into the container
+# Copy the entire vllm codebase to replace the installed version
 # The vllm package is installed at /usr/local/lib/python3.12/dist-packages/vllm
-COPY vllm/reasoning/__init__.py /usr/local/lib/python3.12/dist-packages/vllm/reasoning/__init__.py
-COPY vllm/reasoning/basic_parsers.py /usr/local/lib/python3.12/dist-packages/vllm/reasoning/basic_parsers.py
-COPY vllm/reasoning/kimi_k2_reasoning_parser.py /usr/local/lib/python3.12/dist-packages/vllm/reasoning/kimi_k2_reasoning_parser.py
-COPY vllm/reasoning/deepseek_r1_reasoning_parser.py /usr/local/lib/python3.12/dist-packages/vllm/reasoning/deepseek_r1_reasoning_parser.py
+COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 
-# Tool call parsing fixes
-COPY vllm/tool_parsers/kimi_k2_tool_parser.py /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/kimi_k2_tool_parser.py
-
-# Max request second feature
-COPY vllm/entrypoints/openai/chat_completion/serving.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/chat_completion/serving.py
-COPY vllm/entrypoints/openai/completion/serving.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/completion/serving.py
-COPY vllm/entrypoints/openai/engine/serving.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/engine/serving.py
-COPY vllm/entrypoints/openai/responses/serving.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/responses/serving.py
-COPY vllm/entrypoints/openai/api_server.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py
-COPY vllm/entrypoints/openai/cli_args.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/cli_args.py
+# Remove __pycache__ directories to ensure fresh bytecode compilation
+RUN find /usr/local/lib/python3.12/dist-packages/vllm -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 # The container will use the patched files when vLLM starts
