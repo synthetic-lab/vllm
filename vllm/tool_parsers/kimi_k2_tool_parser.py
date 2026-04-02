@@ -19,6 +19,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
+    Tool,
     ToolParser,
 )
 
@@ -35,8 +36,8 @@ class KimiK2ToolParser(ToolParser):
     <|tool_calls_section_end|>
     """
 
-    def __init__(self, tokenizer: TokenizerLike):
-        super().__init__(tokenizer)
+    def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
+        super().__init__(tokenizer, tools)
 
         # Markers
         self.tool_calls_start_token: str = "<|tool_calls_section_begin|>"
