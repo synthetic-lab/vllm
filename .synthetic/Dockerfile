@@ -2,7 +2,7 @@
 # Based on vllm/vllm-openai:v0.15.0
 # Build with: docker build -f .synthetic/Dockerfile -t syntheticdreamlabs/synthetic-vllm:<VERSION> .
 
-FROM vllm/vllm-openai:nightly-bc2c0c86efb28e77677a3cfb8687e976914a313a
+FROM vllm/vllm-openai:nightly-73f48ce559e230fd0d738c52cb2e99bd0dd08754
 
 # Copy the entire vllm codebase to replace the installed version
 # The vllm package is installed at /usr/local/lib/python3.12/dist-packages/vllm
