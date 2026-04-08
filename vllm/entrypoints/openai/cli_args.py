@@ -281,6 +281,9 @@ class FrontendArgs(BaseFrontendArgs):
     max_request_secs: float | None = None
     """Maximum time in seconds to process a request. If a request exceeds this
     limit, it will be aborted. None means no timeout."""
+    enable_flash_late_interaction: bool = True
+    """If set, run pooling score MaxSim on GPU in the API server process.
+    Can significantly improve late-interaction scoring performance."""
 
     @classmethod
     def _customize_cli_kwargs(
