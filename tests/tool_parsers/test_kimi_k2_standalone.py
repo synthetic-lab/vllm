@@ -22,6 +22,9 @@ sys.modules["vllm.entrypoints.openai.engine"] = MagicMock()
 sys.modules["vllm.entrypoints.openai.engine.protocol"] = MagicMock()
 sys.modules["vllm.tool_parsers"] = MagicMock()
 sys.modules["vllm.tool_parsers.abstract_tool_parser"] = MagicMock()
+sys.modules["vllm.tool_parsers.utils"] = MagicMock()
+sys.modules["vllm.entrypoints.openai.responses"] = MagicMock()
+sys.modules["vllm.entrypoints.openai.responses.protocol"] = MagicMock()
 
 
 # Create mock protocol classes
@@ -101,6 +104,19 @@ class MockToolParser:
 
 
 sys.modules["vllm.tool_parsers.abstract_tool_parser"].ToolParser = MockToolParser  # type: ignore[attr-defined]
+
+
+def partial_tag_overlap(text: str, tag: str) -> int:
+    """Minimal mock: check if text ends with a prefix of tag."""
+    max_check = min(len(tag) - 1, len(text))
+    for k in range(max_check, 0, -1):
+        if text.endswith(tag[:k]):
+            return k
+    return 0
+
+
+sys.modules["vllm.tool_parsers.utils"].partial_tag_overlap = partial_tag_overlap  # type: ignore[attr-defined]
+sys.modules["vllm.entrypoints.openai.responses.protocol"].ResponsesRequest = MagicMock  # type: ignore[attr-defined]
 
 # Now import the actual parser
 from pathlib import Path  # noqa: E402
@@ -243,6 +259,20 @@ def test_streaming_no_tool_calls():
     """Test streaming with no tool calls."""
     parser = KimiK2ToolParser(MockTokenizer())
 
+    # The new streaming implementation tracks _sent_content_idx so it returns
+    # all accumulated unsent content, not just the delta.  Simulate a proper
+    # two-step streaming sequence so the first chunk ("Hello") is already
+    # accounted for before the second chunk (" world") arrives.
+    parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text="Hello",
+        delta_text="Hello",
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=None,
+    )
+
     result = parser.extract_tool_calls_streaming(
         previous_text="Hello",
         current_text="Hello world",
@@ -294,7 +324,12 @@ def test_streaming_tool_call_not_leaked():
 
 
 def test_streaming_reentry_after_section():
-    """Test that content after tool section streams correctly."""
+    """Content after the section-end marker is intentionally suppressed.
+
+    The streaming parser only emits content that appears *before* the
+    tool-calls section.  Text after the section end is dropped to avoid
+    leaking stray model output that follows the tool section.
+    """
     parser = KimiK2ToolParser(MockTokenizer())
 
     deltas = [
@@ -306,8 +341,8 @@ def test_streaming_reentry_after_section():
     results = run_streaming_sequence(parser, deltas)
 
     assert parser.in_tool_section is False
-    assert results[2] is not None
-    assert results[2].content == " More text"
+    # Post-section content is suppressed (not streamed as regular text).
+    assert results[2] is None or "More text" not in (results[2].content or "")
     print("✓ test_streaming_reentry_after_section")
 
 
@@ -338,6 +373,7 @@ def test_state_reset():
     parser.current_tool_id = 5
     parser.prev_tool_call_arr = [{"id": "test"}]
     parser.section_char_count = 1000
+    parser._sent_content_idx = 42
 
     parser.reset_streaming_state()
 
@@ -346,6 +382,7 @@ def test_state_reset():
     assert parser.current_tool_id == -1
     assert parser.prev_tool_call_arr == []
     assert parser.section_char_count == 0
+    assert parser._sent_content_idx == 0
     print("✓ test_state_reset")
 
 

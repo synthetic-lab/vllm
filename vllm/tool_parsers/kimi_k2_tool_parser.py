@@ -16,12 +16,21 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+
+# ResponsesRequest is needed by adjust_request so it can accept both
+# ChatCompletionRequest and ResponsesRequest types.
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
+
+# partial_tag_overlap detects partial marker matches at the end of a string,
+# e.g. text ending in "<|tool_call" when the full marker is "<|tool_call_end|>".
+# This prevents leaking half-formed marker bytes into streamed content.
+from vllm.tool_parsers.utils import partial_tag_overlap
 
 logger = init_logger(__name__)
 
@@ -82,6 +91,12 @@ class KimiK2ToolParser(ToolParser):
 
         # Internal state
         self._last_arguments: str = ""
+        # Tracks how many characters of pre-section content have already been
+        # emitted in streaming.  Without this, content arriving in the same
+        # chunk as the section-begin marker would be silently dropped because
+        # the old buffer-based approach only emitted content *before* the
+        # marker was seen, and never revisited earlier text.
+        self._sent_content_idx: int = 0
 
     @property
     def in_tool_section(self) -> bool:
@@ -103,6 +118,7 @@ class KimiK2ToolParser(ToolParser):
         self.prev_tool_call_arr = []
         self.section_char_count = 0
         self._last_arguments = ""
+        self._sent_content_idx = 0
         logger.debug("Streaming state reset")
 
     def _has_tool_call_markers(self, text: str) -> bool:
@@ -135,6 +151,19 @@ class KimiK2ToolParser(ToolParser):
         # Format: functions.name:index or name:index
         name_part = tool_id.split(":")[0]
         return name_part.split(".")[-1]
+
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        request = super().adjust_request(request)
+        if request.tools and request.tool_choice != "none":
+            # The streaming parser needs the special-token markers (e.g.
+            # <|tool_calls_section_begin|>) to appear as literal text in
+            # current_text so it can detect section boundaries.  If
+            # skip_special_tokens is True the tokenizer strips them out and
+            # the parser never sees them, breaking tool-call extraction.
+            request.skip_special_tokens = False
+        return request
 
     def extract_tool_calls(
         self,
@@ -177,18 +206,121 @@ class KimiK2ToolParser(ToolParser):
                 tools_called=False, tool_calls=[], content=model_output
             )
 
-    def _has_section_end(self, text: str) -> bool:
-        """Check if text contains a section end marker."""
-        return any(variant in text for variant in self.tool_calls_end_token_variants)
+    def _extract_content(self, current_text: str) -> str | None:
+        """Return unsent content before the tool-calls section, or None.
 
-    def _extract_post_section_content(self, text: str) -> str:
-        """Extract any content that appears after the section end marker."""
-        for variant in self.tool_calls_end_token_variants:
-            if variant in text:
-                parts = text.split(variant, 1)
-                if len(parts) > 1:
-                    return parts[1]
-        return ""
+        Holds back any trailing suffix that partially matches
+        ``<|tool_calls_section_begin|>`` to avoid leaking marker bytes.
+        Uses ``_sent_content_idx`` so that content arriving in the same chunk
+        as the section-begin marker is still emitted (the old buffer-based
+        approach would drop it).
+        """
+        if self.tool_calls_start_token not in current_text:
+            # No section marker yet — but the end of current_text might
+            # partially match the start of the marker (e.g. "<|tool_call").
+            # Hold back those bytes so they don't leak into content.
+            overlap = partial_tag_overlap(current_text, self.tool_calls_start_token)
+            sendable_idx = len(current_text) - overlap
+        else:
+            # Section marker found — everything before it is content.
+            sendable_idx = current_text.index(self.tool_calls_start_token)
+
+        if sendable_idx > self._sent_content_idx:
+            content = current_text[self._sent_content_idx : sendable_idx]
+            self._sent_content_idx = sendable_idx
+            return content
+        return None
+
+    def _extract_tool_calls(self, current_text: str) -> list[str]:
+        """Extract raw tool-calls from ``<|tool_call_begin|>…<|tool_call_end|>`` blocks.
+
+        Returns a list of the text between each begin/end pair (including the
+        header and argument marker but not the outer begin/end tokens themselves).
+        Handles truncated streams where the end marker hasn't arrived yet by
+        trimming any partial overlap with the end marker.
+        """
+        if self.tool_calls_start_token not in current_text:
+            return []
+        results: list[str] = []
+        pos = current_text.index(self.tool_calls_start_token)
+        while True:
+            start = current_text.find(self.tool_call_start_token, pos)
+            if start == -1:
+                break
+            tc_start = start + len(self.tool_call_start_token)
+            end = current_text.find(self.tool_call_end_token, tc_start)
+            if end != -1:
+                # Complete tool call — record it and advance past the end marker.
+                tool_call = current_text[tc_start:end]
+                pos = end + len(self.tool_call_end_token)
+            else:
+                # Truncated tool call (stream ended mid-call, e.g. max_tokens).
+                # Trim any partial end-marker overlap so we don't leak
+                # half-formed marker bytes into the arguments.
+                tool_call = current_text[tc_start:]
+                overlap = partial_tag_overlap(tool_call, self.tool_call_end_token)
+                if overlap:
+                    tool_call = tool_call[:-overlap]
+                results.append(tool_call)
+                break
+            results.append(tool_call)
+        return results
+
+    @staticmethod
+    def _extract_tool_id_and_name(
+        header: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Parse (tool_id, tool_name) from a header like ``"functions.get_weather:0"``.
+
+        Returns ``(None, None)`` if the header doesn't match the expected
+        ``name:index`` pattern (e.g. a malformed id like ``"invalid.0"`` with
+        no colon+digit suffix).  This is used during streaming instead of the
+        regex-based non-streaming path so that malformed tool calls are simply
+        skipped rather than raising an exception.
+        """
+        if header is None:
+            return None, None
+        match = re.match(r"(.+:\d+)", header)
+        if not match:
+            return None, None
+        tool_id = match.group(1).strip()
+        # Strip any "functions." prefix to get the bare function name.
+        tool_name = tool_id.split(":")[0].split(".")[-1]
+        return tool_id, tool_name
+
+    def _split_tool_call(self, tool_call: str) -> tuple[str | None, str | None]:
+        """Split a tool-call body into ``(header, arguments)`` at the argument marker.
+
+        Example::
+
+            'get_weather:0 <|tool_call_argument_begin|>{"c'
+            -> ("get_weather:0", '{"c')
+        """
+        arg_pos = tool_call.find(self.tool_call_arg_token)
+        if arg_pos == -1:
+            return None, None
+        header = tool_call[:arg_pos].strip()
+        tool_args = tool_call[arg_pos + len(self.tool_call_arg_token) :]
+        return header, tool_args
+
+    def _compute_args_diff(self, index: int, tool_args: str | None) -> str | None:
+        """Return new argument text not yet sent for tool ``index``, or None.
+
+        Each call compares the current full arguments string against what was
+        previously streamed (stored in ``streamed_args_for_tool``) and emits
+        only the suffix that hasn't been sent yet.
+        """
+        if tool_args is None:
+            return None
+        prev = self.streamed_args_for_tool[index]
+        if len(tool_args) <= len(prev):
+            # Nothing new to send (arguments may have been trimmed due to
+            # partial end-marker overlap on a previous call).
+            return None
+        diff = tool_args[len(prev) :]
+        self.streamed_args_for_tool[index] = tool_args
+        self.prev_tool_call_arr[index]["arguments"] = tool_args
+        return diff
 
     def extract_tool_calls_streaming(
         self,
@@ -200,160 +332,84 @@ class KimiK2ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Streaming tool-call extraction.
+
+        Unlike the old buffer-based approach (which accumulated delta_text into
+        token_buffer and processed it with regex), this method operates on the
+        full current_text each call:
+
+        1. ``_extract_content`` figures out what plain-text content before the
+           section marker hasn't been emitted yet.  It uses _sent_content_idx
+           to track progress, which fixes two bugs:
+           - Content arriving in the same chunk as the section-begin marker was
+             silently dropped (e.g. "Hi! <|tool_calls_section_begin|>…").
+           - Content after the section-end marker was incorrectly streamed as
+             plain text instead of being suppressed.
+
+        2. ``_extract_tool_calls`` finds all complete or in-progress tool-call
+           bodies between begin/end markers.
+
+        3. For each tool call we check whether we've already sent its name/id
+           (first time only) and compute the incremental argument diff.
         """
-        Extract tool calls from streaming output.
-
-        Uses simple string-based detection and regex parsing,
-        following the sglang approach for reliability.
-        """
-        logger.debug("delta_text: %s", delta_text)
-
-        # Accumulate text in buffer
-        self.token_buffer += delta_text
-
-        # Check for section end - if found, process any remaining tool calls
-        # then clear buffer and return any post-section content
-        if self._has_section_end(self.token_buffer):
-            # Process any pending tool calls first
-            result = None
-            if self._has_tool_call_markers(self.token_buffer):
-                try:
-                    result = self._process_tool_call_buffer()
-                except Exception:
-                    logger.exception("Error in streaming tool call parsing")
-
-            # Extract content after section end (if any)
-            post_content = self._extract_post_section_content(self.token_buffer)
-
-            # Clear the buffer - section is complete
-            self.token_buffer = ""
-
-            # If we got a tool call result, return it
-            # Otherwise return empty or post-section content
-            if result is not None:
-                return result
-            if post_content.strip():
-                return DeltaMessage(content=post_content)
-            return DeltaMessage(content="")
-
-        # Check if we have any tool call markers in the accumulated buffer
-        if not self._has_tool_call_markers(self.token_buffer):
-            # No tool calls yet - return delta as regular content
-            # Clear buffer since we know there's no partial marker
-            # (we would have detected the start of one)
-            self.token_buffer = ""
-            # Strip any stray end markers that might appear
-            clean_delta = delta_text
-            for variant in self.tool_calls_end_token_variants:
-                clean_delta = clean_delta.replace(variant, "")
-            clean_delta = clean_delta.replace(self.tool_call_end_token, "")
-            if clean_delta:
-                return DeltaMessage(content=clean_delta)
-            return None
-
-        # We have tool call markers - process the buffer
         try:
-            return self._process_tool_call_buffer()
-        except Exception:
-            logger.exception("Error in streaming tool call parsing")
+            # Step 1: emit any new pre-section content.
+            content = self._extract_content(current_text)
+            # Step 2: find all tool-call bodies in current_text.
+            tool_calls = self._extract_tool_calls(current_text)
+            tool_call_deltas: list[DeltaToolCall] = []
+
+            for i, tool_call in enumerate(tool_calls):
+                # First time seeing a tool call at index i — initialise its
+                # streaming state slot.
+                if i >= len(self.prev_tool_call_arr):
+                    self.prev_tool_call_arr.append({})
+                    self.streamed_args_for_tool.append("")
+
+                header, tool_args = self._split_tool_call(tool_call)
+
+                # Emit the tool name/id exactly once per tool call.
+                if "name" not in self.prev_tool_call_arr[i]:
+                    tool_id, tool_name = self._extract_tool_id_and_name(header)
+                    # If the header is malformed (no "name:digit" pattern),
+                    # skip this tool entirely rather than emitting bad data.
+                    if not tool_name:
+                        break
+                    self.prev_tool_call_arr[i]["name"] = tool_name
+                    self.prev_tool_call_arr[i]["id"] = tool_id
+                    tool_call_deltas.append(
+                        DeltaToolCall(
+                            index=i,
+                            type="function",
+                            id=tool_id,
+                            function=DeltaFunctionCall(name=tool_name).model_dump(
+                                exclude_none=True
+                            ),
+                        )
+                    )
+
+                # Stream back new tool arguments by diffing against what was
+                # already sent for this tool index.
+                args_diff = self._compute_args_diff(i, tool_args)
+                if args_diff:
+                    tool_call_deltas.append(
+                        DeltaToolCall(
+                            index=i,
+                            function=DeltaFunctionCall(arguments=args_diff).model_dump(
+                                exclude_none=True
+                            ),
+                        )
+                    )
+
+            # Only emit a DeltaMessage if there's something to send.
+            # Returning None means "nothing new this chunk" — the caller
+            # should not emit a streaming chunk at all.
+            if content or tool_call_deltas:
+                return DeltaMessage(
+                    content=content,
+                    tool_calls=tool_call_deltas,
+                )
             return None
-
-    def _process_tool_call_buffer(self) -> DeltaMessage | None:
-        """Process the accumulated buffer for tool calls."""
-        # Strip section markers from buffer for cleaner parsing
-        working_text = self._strip_section_markers(self.token_buffer)
-
-        # Try to match a tool call in progress
-        match = self.stream_tool_call_regex.search(working_text)
-
-        if not match:
-            # Have markers but no parseable tool call yet - suppress output
-            # This handles the case between section_begin and first tool_call_begin
-            return DeltaMessage(content="")
-
-        tool_id = match.group("tool_call_id")
-        function_args = match.group("function_arguments")
-        function_name = self._parse_tool_id(tool_id)
-
-        # Initialize state for first tool call
-        if self.current_tool_id == -1:
-            self.current_tool_id = 0
-            self.prev_tool_call_arr = []
-            self.streamed_args_for_tool = [""]
-            self._last_arguments = ""
-
-        # Ensure tracking arrays are large enough
-        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-            self.prev_tool_call_arr.append({})
-        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-            self.streamed_args_for_tool.append("")
-
-        # Case 1: Haven't sent tool name yet
-        if not self.current_tool_name_sent:
-            self.current_tool_name_sent = True
-            self.prev_tool_call_arr[self.current_tool_id] = {
-                "name": function_name,
-                "arguments": "",
-            }
-            return DeltaMessage(
-                tool_calls=[
-                    DeltaToolCall(
-                        index=self.current_tool_id,
-                        type="function",
-                        id=tool_id,
-                        function=DeltaFunctionCall(name=function_name).model_dump(
-                            exclude_none=True
-                        ),
-                    )
-                ]
-            )
-
-        # Case 2: Streaming arguments
-        # Get the arguments portion, stopping at tool_call_end if present
-        args_to_parse = function_args.split(self.tool_call_end_token, 1)[0]
-
-        # Calculate diff from last streamed arguments
-        if args_to_parse.startswith(self._last_arguments):
-            argument_diff = args_to_parse[len(self._last_arguments) :]
-        else:
-            argument_diff = args_to_parse
-
-        result: DeltaMessage | None = None
-
-        if argument_diff:
-            self._last_arguments = args_to_parse
-            self.streamed_args_for_tool[self.current_tool_id] += argument_diff
-            result = DeltaMessage(
-                tool_calls=[
-                    DeltaToolCall(
-                        index=self.current_tool_id,
-                        function=DeltaFunctionCall(arguments=argument_diff).model_dump(
-                            exclude_none=True
-                        ),
-                    )
-                ]
-            )
-
-        # Check if this tool call is complete
-        if self.tool_call_end_token in function_args:
-            # Tool call is complete - prepare for next one
-            # Remove the completed tool call from buffer
-            tool_call_end_pattern = r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
-            end_match = re.search(tool_call_end_pattern, working_text, re.DOTALL)
-            if end_match:
-                # Keep anything after the completed tool call
-                remaining = working_text[end_match.end() :]
-                self.token_buffer = remaining
-            else:
-                self.token_buffer = ""
-
-            # Reset for next tool call
-            self.current_tool_id += 1
-            self.current_tool_name_sent = False
-            self._last_arguments = ""
-
-            # Ensure we return something even if no diff
-            if result is None:
-                result = DeltaMessage(content="")
-
-        return result
+        except Exception:
+            logger.exception("Error trying to handle streaming tool call.")
+            return None
