@@ -112,9 +112,7 @@ class KimiK2ToolParser(ToolParser):
             if variant in text:
                 return True
         # Check for individual tool call marker
-        if self.tool_call_start_token in text:
-            return True
-        return False
+        return self.tool_call_start_token in text
 
     def _strip_section_markers(self, text: str) -> str:
         """Strip section begin/end markers from text."""
@@ -181,10 +179,7 @@ class KimiK2ToolParser(ToolParser):
 
     def _has_section_end(self, text: str) -> bool:
         """Check if text contains a section end marker."""
-        for variant in self.tool_calls_end_token_variants:
-            if variant in text:
-                return True
-        return False
+        return any(variant in text for variant in self.tool_calls_end_token_variants)
 
     def _extract_post_section_content(self, text: str) -> str:
         """Extract any content that appears after the section end marker."""
