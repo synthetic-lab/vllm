@@ -1,7 +1,7 @@
 # Dockerfile to patch vLLM with custom changes (CUDA 13.0 version)
 # Build with: docker build -f .synthetic/cu130.Dockerfile -t syntheticdreamlabs/synthetic-vllm:<VERSION>-cu130 .
 
-FROM vllm/vllm-openai:nightly-01d4d1ad375dc5854779c593eee093bcebb0cada
+FROM vllm/vllm-openai:v0.20.0-cu130
 
 # Preserve compiled extensions (eg. .so files) that may not be checked out.
 RUN cp -r /usr/local/lib/python3.12/dist-packages/vllm/vllm_flash_attn /tmp/vllm_flash_attn_backup
