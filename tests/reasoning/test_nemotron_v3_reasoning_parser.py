@@ -24,8 +24,10 @@ class FakeNemotronTokenizer:
         self._vocab = {
             "<think>": 1,
             "</think>": 2,
+            "<tool_call>": 3,
+            "</tool_call>": 4,
         }
-        self._pattern = re.compile(r"(<think>|</think>)")
+        self._pattern = re.compile(r"(<think>|</think>|<tool_call>|</tool_call>)")
 
     def get_vocab(self) -> dict[str, int]:
         return self._vocab
@@ -170,3 +172,16 @@ def test_nemotron_v3_with_thinking_keeps_truncated_reasoning(
 
     assert reasoning == "This is truncated reasoning"
     assert content is None
+
+
+def test_nemotron_v3_tool_call_implicitly_ends_reasoning(
+    tokenizer: FakeNemotronTokenizer,
+):
+    parser_cls = ReasoningParserManager.get_reasoning_parser(parser_name)
+    parser = parser_cls(tokenizer)
+
+    vocab = tokenizer.get_vocab()
+    token_ids = [99, vocab["<tool_call>"]]
+
+    assert parser.is_reasoning_end(token_ids)
+    assert parser.extract_content_ids(token_ids) == [vocab["<tool_call>"]]
